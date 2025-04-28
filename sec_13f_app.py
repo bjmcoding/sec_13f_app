@@ -16,7 +16,6 @@ from lxml import etree # Use lxml for robust parsing
 from bs4 import BeautifulSoup
 import re
 import time
-from ratelimiter import RateLimiter
 from io import StringIO, BytesIO
 import logging
 from datetime import datetime, timedelta
