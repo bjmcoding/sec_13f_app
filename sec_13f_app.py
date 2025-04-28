@@ -15,7 +15,6 @@ from lxml import etree # Use lxml for robust parsing
 from bs4 import BeautifulSoup
 import re
 import time
-# Removed: from ratelimiter import RateLimiter (no longer needed/used)
 from io import StringIO, BytesIO
 import logging
 from datetime import datetime, timedelta
@@ -46,7 +45,7 @@ class SECEdgarHandler:
     SUBMISSIONS_API_URL = f"https://data.sec.gov/submissions/CIK{{cik}}.json"
 
     # Ensure correct indentation for methods (Level 1)
-    def __init__(self, user_agent): # <<< Line 47 area - Ensure 4 spaces indentation
+    def __init__(self, user_agent): # <<< Ensure 4 spaces indentation
         # Ensure correct indentation for code within methods (Level 2)
         self.user_agent = user_agent
         self.session = self._create_session()
@@ -227,19 +226,18 @@ class SECEdgarHandler:
 
         # --- Step 3: Parse Primary Document Manifest ---
         try:
-            # Regex to find <DOCUMENT> blocks, tolerant to variations
             # Using re.split is sometimes more robust than re.findall for nested/malformed structures
             parts = re.split(r'</?DOCUMENT>', primary_doc_content, flags=re.IGNORECASE | re.DOTALL)
-            # Skip the first part (before the first <DOCUMENT>) and process pairs
-            document_blocks = parts[1:] # Get content within <DOCUMENT> tags
+            document_blocks = parts[1:] # Get content potentially within <DOCUMENT> tags
             logging.info(f"Found {len(document_blocks)} potential document blocks in primary doc.")
 
             for block in document_blocks:
-                # More robust regex to handle potential extra whitespace/newlines
-                type_match = re.search(r'<TYPE>\s*(.*?)\s*<', block, re.IGNORECASE | re.DOTALL)
-                filename_match = re.search(r'<FILENAME>\s*(.*?)\s*<', block, re.IGNORECASE | re.DOTALL)
+                 if not block.strip(): continue # Skip empty blocks from split
+                 # More robust regex to handle potential extra whitespace/newlines within tags
+                 type_match = re.search(r'<TYPE>\s*(.*?)\s*<', block, re.IGNORECASE | re.DOTALL)
+                 filename_match = re.search(r'<FILENAME>\s*(.*?)\s*<', block, re.IGNORECASE | re.DOTALL)
 
-                if type_match and filename_match:
+                 if type_match and filename_match:
                     doc_type = type_match.group(1).strip().upper()
                     doc_filename = filename_match.group(1).strip()
 
@@ -292,20 +290,18 @@ class SECEdgarHandler:
 
                                 if doc_link and doc_link.has_attr('href'):
                                     filename = doc_link.get_text(strip=True)
+                                    href = doc_link['href']
                                     # Check if type/description indicates information table
-                                    if 'INFORMATION TABLE' in type_desc_text or '13F TABLE' in type_desc_text or type_desc_text == 'XML': # Some might just say XML here
+                                    if 'INFORMATION TABLE' in type_desc_text or '13F TABLE' in type_desc_text:
                                          if filename.lower().endswith('.xml'):
                                              logging.info(f"Found Info Table via HTML Index: Type='{type_desc_text}', Filename='{filename}'")
                                              return filename
+                                         # Check if href points to XML even if text doesn't say .xml
+                                         elif href.lower().endswith('.xml'):
+                                             xml_filename_from_href = href.split('/')[-1]
+                                             logging.info(f"Found Info Table XML via HTML Index Href: Type='{type_desc_text}', Href='{href}', Filename='{xml_filename_from_href}'")
+                                             return xml_filename_from_href
                                          else:
-                                             # It might link to HTML version, check href
-                                             href = doc_link['href']
-                                             if href.lower().endswith('.xml'):
-                                                 xml_filename_from_href = href.split('/')[-1]
-                                                 logging.info(f"Found Info Table XML via HTML Index Href: Type='{type_desc_text}', Href='{href}', Filename='{xml_filename_from_href}'")
-                                                 return xml_filename_from_href
-
-                                            # If filename doesn't end with .xml and href doesn't either, skip
                                              logging.warning(f"Found INFORMATION TABLE type '{type_desc_text}' in HTML index, but link '{filename}'/'{href}' doesn't point to XML. Skipping.")
                             except IndexError:
                                  logging.warning("Skipping row in HTML table due to unexpected cell count.")
@@ -330,8 +326,8 @@ class SECEdgarHandler:
                 if response.status_code == 200:
                      # Double check content type if possible
                      content_type = response.headers.get('Content-Type', '').lower()
-                     if 'xml' in content_type:
-                          logging.info(f"Found Info Table via Default Filename Check: '{filename}'")
+                     if 'xml' in content_type or 'text/plain' in content_type: # Accept text/plain too just in case
+                          logging.info(f"Found Info Table via Default Filename Check: '{filename}' (Content-Type: {content_type})")
                           return filename
                      else:
                           logging.warning(f"Default filename '{filename}' found but Content-Type is '{content_type}'. Skipping.")
@@ -358,6 +354,9 @@ class SECEdgarHandler:
         # Use response.content for potentially binary XML data
         return response.content if response else None
 
+    # ========================================================================
+    # REVISED parse_info_table_xml method starts here
+    # ========================================================================
     def parse_info_table_xml(self, xml_content):
         """Parses the 13F Information Table XML into a pandas DataFrame."""
         if not xml_content:
@@ -367,141 +366,241 @@ class SECEdgarHandler:
             # Use BytesIO to handle the XML content
             xml_file = BytesIO(xml_content)
             # Try parsing, remove processing instructions which can cause issues
-            tree = etree.parse(xml_file, parser=etree.XMLParser(remove_pis=True))
+            # Add recover=True to handle minor XML errors if possible
+            parser = etree.XMLParser(remove_pis=True, recover=True)
+            tree = etree.parse(xml_file, parser=parser)
             root = tree.getroot()
 
-            # Define XML namespaces dynamically if possible, or use common ones
-            # Attempt to get namespace from root element
-            nsmap = root.nsmap
-            default_ns_key = None
-            # Find the key for the default namespace (if any)
-            for key, value in nsmap.items():
-                if key is None: # Default namespace has None key in lxml nsmap
-                     default_ns_key = "defns" # Assign a temporary key for xpath
-                     nsmap[default_ns_key] = value
-                     break
+            # --- Namespace Handling ---
+            ns = {}
+            # Check for a default namespace (xmlns="...") defined on the root element
+            # Use nsmap attribute available on elements
+            if root.nsmap:
+                default_uri = root.nsmap.get(None)
+                if default_uri:
+                    ns['dflt'] = default_uri # Assign 'dflt' prefix to the default namespace URI
+                    logging.info(f"Detected default namespace: {default_uri}")
 
-            # Fallback/Common namespaces if dynamic detection fails or isn't enough
-            ns_common = {
-                'ns': 'http://www.sec.gov/edgar/document/thirteenf/informationtable',
-                'ns1': 'http://www.sec.gov/edgar/thirteenffiler'
-                # Add others if needed based on observation
-            }
-            # Combine dynamic and common namespaces (dynamic takes precedence if key overlaps)
-            ns = ns_common.copy()
-            if nsmap:
-                 ns.update(nsmap)
+            # Define common 13F table namespace URI
+            common_table_ns_uri = 'http://www.sec.gov/edgar/document/thirteenf/informationtable'
+            # Add common prefix 'tns' if this URI isn't the default or already mapped
+            # Check against ns.values() to see if the URI is already mapped
+            if common_table_ns_uri not in ns.values():
+                 ns['tns'] = common_table_ns_uri
+                 logging.info(f"Adding common table namespace prefix 'tns' for URI: {common_table_ns_uri}")
 
-            # Helper to find elements with namespace handling
-            def find_all_with_ns(element, path_segments):
-                xpath_expr = ".//"
-                xpath_parts = []
-                for segment in path_segments:
-                    # Try default namespace first if detected
-                    if default_ns_key and default_ns_key in ns:
-                         xpath_parts.append(f"{default_ns_key}:{segment}")
-                    else:
-                         # Try common 'ns' prefix
-                         xpath_parts.append(f"ns:{segment}")
-                         # Add fallback without namespace
-                         xpath_parts.append(f"{segment}")
+            # Copy other explicit prefixes from the root element's nsmap if needed
+            if hasattr(root, 'nsmap'):
+                 for prefix, uri in root.nsmap.items():
+                      if prefix and prefix not in ns: # Avoid overwriting 'dflt' or 'tns' if keys clash
+                           ns[prefix] = uri
+                           logging.info(f"Adding explicit namespace prefix '{prefix}' for URI: {uri}")
 
-                # Construct a more flexible XPath: //(defns:tag|ns:tag|tag)
-                xpath_expr += "/".join([f"({ '|'.join(xpath_parts[i*len(path_segments):(i+1)*len(path_segments)]) })" for i in range(len(path_segments))])
+            # --- Find InfoTable elements ---
+            # Construct XPath to find infoTable using potential prefixes OR local-name()
+            infotable_paths = []
+            if 'dflt' in ns: infotable_paths.append('.//dflt:infoTable')
+            if 'tns' in ns: infotable_paths.append('.//tns:infoTable')
+            infotable_paths.append('.//infoTable') # No namespace case
+            # Add local-name() fallback directly in the main query
+            infotable_xpath = " | ".join(infotable_paths) + " | .//*[local-name()='infoTable']"
+            logging.info(f"Using XPath for infoTable: {infotable_xpath}")
 
-                # Simpler approach: try combinations known to work
-                paths_to_try = []
-                base_path = ".//" + "/".join(path_segments)
-                paths_to_try.append(base_path) # No namespace
-                if default_ns_key:
-                     paths_to_try.append(".//" + "/".join([f"{default_ns_key}:{s}" for s in path_segments]))
-                paths_to_try.append(".//" + "/".join([f"ns:{s}" for s in path_segments])) # Common ns
+            info_tables = root.xpath(infotable_xpath, namespaces=ns)
 
-                found = []
-                for p in paths_to_try:
-                    try:
-                        found = element.xpath(p, namespaces=ns)
-                        if found: break # Stop if found
-                    except etree.XPathEvalError: # Handle invalid expressions if namespaces missing
-                        continue
-                return found
-
-            # Extract data for each holding ('infoTable' element)
-            holdings = []
-            # Find 'infoTable' elements using flexible namespace search
-            info_tables = root.xpath('.//infoTable | .//ns:infoTable | .//defns:infoTable', namespaces=ns)
             if not info_tables:
-                logging.warning("Could not find any 'infoTable' elements in the XML.")
-                return pd.DataFrame()
+                 # Check if the root element itself is the infoTable (less common but possible)
+                 root_tag_local = etree.QName(root.tag).localname
+                 if root_tag_local == 'infoTable':
+                      info_tables = [root]
+                      logging.info("Root element itself is infoTable.")
+                 else:
+                      logging.warning(f"Could not find any 'infoTable' elements using XPath: {infotable_xpath}")
+                      st.error("Failed to find 'infoTable' elements in the XML structure.")
+                      return pd.DataFrame()
+
 
             logging.info(f"Found {len(info_tables)} infoTable elements.")
+            holdings = []
 
-            for table in info_tables:
-                 holding = {}
-                 # Helper to safely get text from the first element found
-                 def get_text_safe(element, path_list):
-                      found = find_all_with_ns(element, path_list)
-                      return found[0].text.strip() if found and found[0].text else None
+            # Helper to get text using appropriate prefix, trying multiple paths including local-name()
+            def get_text_xpath(element, tag_name):
+                paths_to_try = []
+                # Prioritize known/detected prefixes
+                if 'dflt' in ns: paths_to_try.append(f'.//dflt:{tag_name}')
+                if 'tns' in ns: paths_to_try.append(f'.//tns:{tag_name}')
+                # Try other explicit prefixes found in the document
+                for prefix in ns:
+                     if prefix not in ['dflt', 'tns']:
+                          paths_to_try.append(f'.//{prefix}:{tag_name}')
+                # Fallback to no namespace prefix
+                paths_to_try.append(f'.//{tag_name}')
+                # Fallback to local-name()
+                paths_to_try.append(f'.//*[local-name()="{tag_name}"]')
 
-                 holding['nameOfIssuer'] = get_text_safe(table, ['nameOfIssuer'])
-                 holding['titleOfClass'] = get_text_safe(table, ['titleOfClass'])
-                 holding['cusip'] = get_text_safe(table, ['cusip'])
+                for path in paths_to_try:
+                    try:
+                        # Use findall which is sometimes more forgiving than full xpath
+                        results = element.findall(path, namespaces=ns)
+                        # If findall fails or path is local-name(), try xpath
+                        if not results and '*' in path:
+                             results = element.xpath(path, namespaces=ns)
 
-                 value_text = get_text_safe(table, ['value'])
-                 holding['value'] = int(value_text.replace(',', '')) * 1000 if value_text else 0
+                        # Process results: get text from the first non-empty result
+                        for res in results:
+                             if res is not None and res.text is not None and res.text.strip():
+                                  # logging.debug(f"Found text for '{tag_name}' using path: {path}")
+                                  return res.text.strip()
+                    except (etree.XPathEvalError, etree.XPathSyntaxError, TypeError) as e:
+                        # Ignore path if prefix is invalid or other XPath error
+                        logging.debug(f"XPath/Find error for tag '{tag_name}' with path '{path}': {e}")
+                        continue
 
-                 ssh_prnamt = get_text_safe(table, ['shrsOrPrnAmt', 'sshPrnamt'])
-                 ssh_prnamt_type = get_text_safe(table, ['shrsOrPrnAmt', 'sshPrnamtType'])
-                 # Handle cases where shrsOrPrnAmt might be directly under infoTable
-                 if ssh_prnamt is None:
-                     ssh_prnamt = get_text_safe(table, ['sshPrnamt'])
-                 if ssh_prnamt_type is None:
-                      ssh_prnamt_type = get_text_safe(table, ['sshPrnamtType'])
+                logging.warning(f"Could not find text for tag '{tag_name}' using any path.")
+                return None # Return None if not found
 
-                 holding['sshPrnamt'] = int(ssh_prnamt.replace(',', '')) if ssh_prnamt else 0
-                 holding['sshPrnamtType'] = ssh_prnamt_type
+            # Helper for nested structures like shrsOrPrnAmt/sshPrnamt using similar logic
+            def get_nested_text_xpath(element, path_tags):
+                # Simple implementation: try combinations of prefixes/no prefix for each tag
+                # This is complex to get perfectly general, focus on common patterns
 
-                 holding['investmentDiscretion'] = get_text_safe(table, ['investmentDiscretion'])
+                # Pattern 1: All default namespace
+                if 'dflt' in ns:
+                    path1 = ".//" + "/".join([f"dflt:{t}" for t in path_tags])
+                    results1 = element.xpath(path1, namespaces=ns)
+                    if results1 and results1[0].text is not None and results1[0].text.strip():
+                        return results1[0].text.strip()
 
-                 sole_auth = get_text_safe(table, ['votingAuthority', 'Sole'])
-                 shared_auth = get_text_safe(table, ['votingAuthority', 'Shared'])
-                 none_auth = get_text_safe(table, ['votingAuthority', 'None'])
+                # Pattern 2: All common 'tns' namespace
+                if 'tns' in ns:
+                    path2 = ".//" + "/".join([f"tns:{t}" for t in path_tags])
+                    results2 = element.xpath(path2, namespaces=ns)
+                    if results2 and results2[0].text is not None and results2[0].text.strip():
+                        return results2[0].text.strip()
 
-                 holding['votingAuthSole'] = int(sole_auth.replace(',', '')) if sole_auth else 0
-                 holding['votingAuthShared'] = int(shared_auth.replace(',', '')) if shared_auth else 0
-                 holding['votingAuthNone'] = int(none_auth.replace(',', '')) if none_auth else 0
+                 # Pattern 3: No namespace
+                path3 = ".//" + "/".join(path_tags)
+                results3 = element.xpath(path3, namespaces=ns) # ns might be needed if prefixes used elsewhere
+                if results3 and results3[0].text is not None and results3[0].text.strip():
+                    return results3[0].text.strip()
 
-                 # Add only if CUSIP is present (basic validity check)
-                 if holding['cusip']:
-                      holdings.append(holding)
-                 else:
-                      logging.warning(f"Skipping holding record due to missing CUSIP: {holding.get('nameOfIssuer')}")
+                # Pattern 4: local-name() fallback
+                path4 = ".//" + "/".join([f'*[local-name()="{t}"]' for t in path_tags])
+                results4 = element.xpath(path4) # No ns needed for local-name() generally
+                if results4 and results4[0].text is not None and results4[0].text.strip():
+                     logging.debug(f"Used local-name() fallback for nested path '{'/'.join(path_tags)}'")
+                     return results4[0].text.strip()
+
+
+                logging.warning(f"Could not find nested text for path '{'/'.join(path_tags)}' using common patterns.")
+                return None
+
+
+            for i, table in enumerate(info_tables):
+                holding = {}
+                try:
+                    holding['nameOfIssuer'] = get_text_xpath(table, 'nameOfIssuer')
+                    holding['titleOfClass'] = get_text_xpath(table, 'titleOfClass')
+                    holding['cusip'] = get_text_xpath(table, 'cusip')
+                    value_text = get_text_xpath(table, 'value')
+                    # Handle potential non-numeric issues before conversion
+                    if value_text:
+                         value_cleaned = value_text.replace(',', '').strip()
+                         holding['value'] = int(value_cleaned) * 1000 if value_cleaned.isdigit() else 0
+                    else:
+                         holding['value'] = 0
+
+                    # Try nested structure first, then direct access for shrsOrPrnAmt fields
+                    ssh_prnamt = get_nested_text_xpath(table, ['shrsOrPrnAmt', 'sshPrnamt'])
+                    if ssh_prnamt is None: ssh_prnamt = get_text_xpath(table, 'sshPrnamt')
+
+                    ssh_prnamt_type = get_nested_text_xpath(table, ['shrsOrPrnAmt', 'sshPrnamtType'])
+                    if ssh_prnamt_type is None: ssh_prnamt_type = get_text_xpath(table, 'sshPrnamtType')
+
+                    # Handle potential non-numeric issues before conversion
+                    if ssh_prnamt:
+                         ssh_cleaned = ssh_prnamt.replace(',', '').strip()
+                         holding['sshPrnamt'] = int(ssh_cleaned) if ssh_cleaned.isdigit() else 0
+                    else:
+                         holding['sshPrnamt'] = 0
+                    holding['sshPrnamtType'] = ssh_prnamt_type
+
+                    holding['investmentDiscretion'] = get_text_xpath(table, 'investmentDiscretion')
+
+                    # Try nested structure first for votingAuthority
+                    sole_auth = get_nested_text_xpath(table, ['votingAuthority', 'Sole'])
+                    shared_auth = get_nested_text_xpath(table, ['votingAuthority', 'Shared'])
+                    none_auth = get_nested_text_xpath(table, ['votingAuthority', 'None'])
+
+                    # Handle potential non-numeric issues before conversion
+                    holding['votingAuthSole'] = int(sole_auth.replace(',', '').strip()) if sole_auth and sole_auth.replace(',', '').strip().isdigit() else 0
+                    holding['votingAuthShared'] = int(shared_auth.replace(',', '').strip()) if shared_auth and shared_auth.replace(',', '').strip().isdigit() else 0
+                    holding['votingAuthNone'] = int(none_auth.replace(',', '').strip()) if none_auth and none_auth.replace(',', '').strip().isdigit() else 0
+
+                    # Basic validation check - require CUSIP
+                    if holding['cusip']:
+                        # CUSIP validation/cleaning
+                        cusip_cleaned = holding['cusip'].strip().upper()
+                        if len(cusip_cleaned) > 9:
+                             logging.warning(f"Correcting CUSIP length > 9: '{cusip_cleaned}' to '{cusip_cleaned[:9]}' for {holding.get('nameOfIssuer')}")
+                             cusip_cleaned = cusip_cleaned[:9]
+                        # Allow slightly short CUSIPs if needed, or enforce 9 exactly
+                        if len(cusip_cleaned) < 8: # Allow 8 or 9? Let's be strict for now.
+                              logging.warning(f"Skipping holding record due to invalid CUSIP length '{cusip_cleaned}' for {holding.get('nameOfIssuer')}")
+                              continue # Skip invalid CUSIP
+                        holding['cusip'] = cusip_cleaned # Store cleaned CUSIP
+                        holdings.append(holding)
+                    else:
+                        logging.warning(f"Skipping holding record #{i+1} due to missing CUSIP: Name='{holding.get('nameOfIssuer')}'")
+
+                except Exception as e:
+                     logging.error(f"Error processing holding record #{i+1}: {e}. Record data: {holding}", exc_info=True)
+                     # Optionally skip this record or handle differently
+                     continue
 
 
             if not holdings:
-                 logging.warning("No valid holdings extracted from infoTable elements.")
+                 logging.warning("No valid holdings extracted after processing infoTable elements.")
+                 # Don't show streamlit error here, let calling function handle empty df
+                 # st.warning("Parsed the XML file, but found no valid holding records.")
                  return pd.DataFrame()
 
             df = pd.DataFrame(holdings)
-            # Basic cleaning
+            # Perform cleaning after creating the DataFrame
             df['value'] = pd.to_numeric(df['value'], errors='coerce').fillna(0).astype(float)
             df['sshPrnamt'] = pd.to_numeric(df['sshPrnamt'], errors='coerce').fillna(0).astype(int)
             df['votingAuthSole'] = pd.to_numeric(df['votingAuthSole'], errors='coerce').fillna(0).astype(int)
             df['votingAuthShared'] = pd.to_numeric(df['votingAuthShared'], errors='coerce').fillna(0).astype(int)
             df['votingAuthNone'] = pd.to_numeric(df['votingAuthNone'], errors='coerce').fillna(0).astype(int)
-            df['cusip'] = df['cusip'].str.strip().str.upper() # Standardize CUSIP
+            # Ensure CUSIP is string, stripped, and uppercase
+            df['cusip'] = df['cusip'].astype(str).str.strip().str.upper()
+            # Additional cleaning - remove potential non-printable chars from strings
+            str_cols = ['nameOfIssuer', 'titleOfClass', 'sshPrnamtType', 'investmentDiscretion']
+            for col in str_cols:
+                 if col in df.columns:
+                      # Fill NA before regex to avoid errors
+                      df[col] = df[col].fillna('').astype(str).str.replace(r'[^\x20-\x7E]+', '', regex=True).str.strip()
 
-            logging.info(f"Successfully parsed {len(df)} holdings from XML.")
+            logging.info(f"Successfully parsed and cleaned {len(df)} holdings from XML.")
             return df
 
+        # Keep existing error handling for XMLSyntaxError and general Exceptions
         except etree.XMLSyntaxError as e:
-            logging.error(f"XML Syntax Error parsing info table: {e}")
-            st.error(f"Failed to parse the XML holdings table. It might be malformed. Error: {e}")
+            # Provide more context if possible from the error object
+            line = getattr(e, 'lineno', 'N/A')
+            pos = getattr(e, 'position', 'N/A')
+            msg = getattr(e, 'msg', str(e))
+            logging.error(f"XML Syntax Error parsing info table (Line: {line}, Pos: {pos}): {msg}")
+            st.error(f"Failed to parse the XML holdings table (Line: {line}). It might be malformed. Error: {msg}")
             return pd.DataFrame()
         except Exception as e:
-            logging.error(f"Unexpected error parsing info table XML: {e}")
+            logging.error(f"Unexpected error during XML parsing or DataFrame creation: {e}", exc_info=True) # Add traceback
             st.error(f"An unexpected error occurred during XML parsing: {e}")
             return pd.DataFrame()
+    # ========================================================================
+    # End of REVISED parse_info_table_xml method
+    # ========================================================================
+
 
 # --- Data Processing Functions ---
 
@@ -510,24 +609,26 @@ def get_holdings_data(cik, year, quarter):
     """
     Orchestrates fetching and parsing 13F holdings data for a specific CIK and quarter.
     """
-    # Create handler instance inside function to ensure session is fresh if needed,
-    # though caching might make this less critical unless sessions expire/fail.
     handler = SECEdgarHandler(SEC_USER_AGENT)
     accession_number = handler.find_latest_13f_hr_accession(cik, year, quarter)
     if not accession_number:
-        return pd.DataFrame() # Error/warning shown by find_latest_13f_hr_accession
+        return None # Indicate failure clearly, None is better than empty DF sometimes
 
     xml_filename = handler.find_info_table_xml_filename(cik, accession_number)
     if not xml_filename:
-         return pd.DataFrame() # Error shown by find_info_table_xml_filename
+         return None # Indicate failure
 
     xml_url = handler._get_info_table_xml_url(cik, accession_number, xml_filename)
     xml_content = handler._fetch_info_table_xml(xml_url)
     if not xml_content:
          st.error(f"Failed to download the XML file: {xml_url}")
-         return pd.DataFrame()
+         return None # Indicate failure
 
-    return handler.parse_info_table_xml(xml_content)
+    # Parse_info_table_xml now returns df or empty df on error, or None if major issue
+    parsed_df = handler.parse_info_table_xml(xml_content)
+    # Return None if parsing failed critically, otherwise return the DataFrame (even if empty)
+    return parsed_df
+
 
 def get_previous_quarter(year, quarter):
     """ Calculates the year and quarter for the previous period. """
@@ -541,45 +642,55 @@ def calculate_holding_changes(_df_curr, _df_prev):
     """
     Compares holdings between two quarters (DataFrames) and calculates changes.
     Uses _df_curr, _df_prev because Streamlit caching decorators modify argument handling.
+    Handles None inputs for dataframes.
     """
+    # Handle cases where dataframes might be None
+    if _df_curr is None:
+         logging.error("Current holdings data is None, cannot calculate changes.")
+         return pd.DataFrame() # Return empty if current data is missing
+    if _df_prev is None:
+         logging.warning("Previous holdings data is None. All current holdings marked as 'New'.")
+         _df_prev = pd.DataFrame() # Treat as empty for calculation
+
     # Ensure dataframes have necessary columns, handle potential errors if parsing failed partially
     required_cols = ['cusip', 'nameOfIssuer', 'sshPrnamt', 'value']
     if not all(col in _df_curr.columns for col in required_cols):
          logging.error("Current holdings DataFrame is missing required columns for change calculation.")
-         # Return minimal change info if possible, or empty
-         _df_curr['change_type'] = 'Error'
-         _df_curr['change_shares'] = pd.NA
-         _df_curr['change_value'] = pd.NA
-         _df_curr['change_pct'] = pd.NA
-         return _df_curr
+         _df_curr['change_type'] = 'Error (Missing Cols)'
+         # Fill missing columns with NA or default values if possible for display
+         for col in required_cols + ['change_shares', 'change_value', 'change_pct']:
+              if col not in _df_curr.columns:
+                   _df_curr[col] = pd.NA
+         return _df_curr[['cusip', 'nameOfIssuer', 'sshPrnamt', 'value', 'change_type', 'change_shares', 'change_value', 'change_pct']]
+
     if not _df_prev.empty and not all(col in _df_prev.columns for col in required_cols):
-          logging.warning("Previous holdings DataFrame is missing required columns. Treating as empty for change calc.")
-          _df_prev = pd.DataFrame(columns=_df_curr.columns) # Use empty df with same columns
+          logging.warning("Previous holdings DataFrame exists but missing required columns. Treating as empty.")
+          _df_prev = pd.DataFrame(columns=required_cols) # Use empty df with correct columns
 
     # Make copies to avoid modifying cached dataframes
     df_curr_copy = _df_curr.copy()
     df_prev_copy = _df_prev.copy()
 
     if df_prev_copy.empty:
-        # If previous quarter data is missing, mark all current holdings as New
+        # If previous quarter data is missing/empty, mark all current holdings as New
         df_curr_copy['change_type'] = 'New'
         df_curr_copy['change_shares'] = df_curr_copy['sshPrnamt']
         df_curr_copy['change_value'] = df_curr_copy['value']
-        df_curr_copy['change_pct'] = 100.0 # Or pd.NA
+        df_curr_copy['change_pct'] = 100.0 # Or pd.NA if preferred
         return df_curr_copy[['cusip', 'nameOfIssuer', 'sshPrnamt', 'value', 'change_type', 'change_shares', 'change_value', 'change_pct']]
 
-    # Aggregate duplicate CUSIPs before merging (e.g., separate PUT/CALL options on same CUSIP)
+    # Aggregate duplicate CUSIPs before merging (important for options etc.)
     # Sum numeric columns, keep first for strings
     df_curr_agg = df_curr_copy.groupby('cusip').agg(
-        nameOfIssuer=('nameOfIssuer', 'first'),
+        # Take first non-NA name, then first overall
+        nameOfIssuer=('nameOfIssuer', lambda x: x.dropna().iloc[0] if not x.dropna().empty else x.iloc[0]),
         sshPrnamt=('sshPrnamt', 'sum'),
-        value=('value', 'sum'),
-        # Add other columns if needed, e.g., take 'first' titleOfClass
+        value=('value', 'sum')
     ).reset_index()
     df_prev_agg = df_prev_copy.groupby('cusip').agg(
-        nameOfIssuer=('nameOfIssuer', 'first'),
+        nameOfIssuer=('nameOfIssuer', lambda x: x.dropna().iloc[0] if not x.dropna().empty else x.iloc[0]),
         sshPrnamt=('sshPrnamt', 'sum'),
-        value=('value', 'sum'),
+        value=('value', 'sum')
     ).reset_index()
 
 
@@ -598,15 +709,15 @@ def calculate_holding_changes(_df_curr, _df_prev):
         # Use current name if available, otherwise previous name
         name = row['nameOfIssuer_curr'] if pd.notna(row['nameOfIssuer_curr']) else row['nameOfIssuer_prev']
         # Handle potential NaN values from outer join, default to 0
-        shares_curr = row['sshPrnamt_curr'] if pd.notna(row['sshPrnamt_curr']) else 0
-        value_curr = row['value_curr'] if pd.notna(row['value_curr']) else 0
-        shares_prev = row['sshPrnamt_prev'] if pd.notna(row['sshPrnamt_prev']) else 0
-        value_prev = row['value_prev'] if pd.notna(row['value_prev']) else 0
+        shares_curr = int(row['sshPrnamt_curr']) if pd.notna(row['sshPrnamt_curr']) else 0
+        value_curr = float(row['value_curr']) if pd.notna(row['value_curr']) else 0.0
+        shares_prev = int(row['sshPrnamt_prev']) if pd.notna(row['sshPrnamt_prev']) else 0
+        value_prev = float(row['value_prev']) if pd.notna(row['value_prev']) else 0.0
 
         change_type = ''
         change_shares = 0
         change_value = 0.0
-        change_pct = 0.0
+        change_pct = pd.NA # Default to NA for percentage
 
         # Determine change type
         is_new = shares_curr > 0 and shares_prev == 0
@@ -628,9 +739,9 @@ def calculate_holding_changes(_df_curr, _df_prev):
             change_value = value_curr - value_prev
             # Calculate percentage change carefully
             if shares_prev != 0:
+                 # Use value change % if shares are zero? Or stick to shares? Stick to shares for now.
                  change_pct = (shares_curr - shares_prev) / shares_prev * 100.0
-            else: # Should not happen if shares_prev > 0, but safety
-                 change_pct = pd.NA # Indeterminate percentage change from zero
+            # else: change_pct remains pd.NA (indeterminate percentage change from zero)
 
             # Assign type based on share change
             if change_shares > 0:
@@ -638,11 +749,14 @@ def calculate_holding_changes(_df_curr, _df_prev):
             elif change_shares < 0:
                 change_type = 'Decreased'
             else:
-                 # If shares are same, check value change (could be price fluctuation)
-                 if value_curr != value_prev:
+                 # If shares are same, check value change (price fluctuation or reporting diff)
+                 if abs(value_curr - value_prev) > 1: # Check for non-trivial value change (allow for rounding)
                      change_type = 'Value Change Only'
+                     # Calculate value % change if desired
+                     # if value_prev != 0: change_pct = (value_curr - value_prev) / value_prev * 100.0
                  else:
                       change_type = 'Unchanged'
+                      change_pct = 0.0 # Explicitly 0% change
         else:
              # Both are zero - this row resulted from merge but represents no holding
              continue # Skip rows where holding was zero in both periods
@@ -668,7 +782,7 @@ def calculate_holding_changes(_df_curr, _df_prev):
     df_changes['sshPrnamt'] = pd.to_numeric(df_changes['sshPrnamt'], errors='coerce').fillna(0).astype(int)
     df_changes['change_shares'] = pd.to_numeric(df_changes['change_shares'], errors='coerce').fillna(0).astype(int)
     df_changes['change_value'] = pd.to_numeric(df_changes['change_value'], errors='coerce').fillna(0).astype(float)
-    df_changes['change_pct'] = pd.to_numeric(df_changes['change_pct'], errors='coerce').fillna(pd.NA) # Allow NA for percentage
+    df_changes['change_pct'] = pd.to_numeric(df_changes['change_pct'], errors='coerce').fillna(pd.NA) # Allow NA
 
     return df_changes
 
@@ -723,11 +837,16 @@ if month >= 5 and month < 8: # Data for Q1 current year filed by May 15
 if month >= 8 and month < 11: # Data for Q2 current year filed by Aug 14
      default_q = 2
      default_year = current_year
-if month >= 11: # Data for Q3 current year filed by Nov 14
-     default_q = 3
-     default_year = current_year
+if month >= 11 or month < 2: # Data for Q3 current year filed by Nov 14, or if Jan check prev year Q4
+    if month >= 11:
+        default_q = 3
+        default_year = current_year
+    else: # Month is Jan
+         default_q = 4
+         default_year = current_year -1
 
-# Set default year index, handling case where default_year might not be in list (unlikely here)
+
+# Set default year index, handling case where default_year might not be in list
 try:
     default_year_index = years.index(default_year)
 except ValueError:
@@ -766,34 +885,37 @@ st.sidebar.info(
 
 # --- Main Application Logic ---
 
-# Use Streamlit's session state for caching fetched data to avoid re-fetching when inputs change slightly
-if 'holdings_cache' not in st.session_state:
-    st.session_state.holdings_cache = {}
+# Use Streamlit's session state for caching fetched data? Caching is done per function call with @st.cache_data
+# No explicit session state cache needed here unless we want to aggregate across runs differently.
 
 def load_manager_data(cik_list, year, quarter):
     """Loads current and previous quarter data for multiple managers using Streamlit functions."""
     prev_year, prev_quarter = get_previous_quarter(year, quarter)
     loaded_data = {} # {cik: {'current': df, 'previous': df}}
-    progress_bar = st.progress(0, text="Loading manager data...")
     total_ciks = len(cik_list)
+    # Use st.status for better progress indication
+    with st.status(f"Loading data for {total_ciks} manager(s)...", expanded=False) as status:
+        for i, cik in enumerate(cik_list):
+            st.write(f"({i+1}/{total_ciks}) Loading data for CIK: {cik}...")
 
-    for i, cik in enumerate(cik_list):
-        progress_text = f"Processing CIK: {cik} ({i+1}/{total_ciks})"
-        progress_bar.progress((i + 1) / total_ciks, text=progress_text)
+            # Fetch current quarter data using the cached function
+            df_curr = get_holdings_data(cik, year, quarter)
+            if df_curr is not None:
+                 st.write(f"-> Q{quarter} {year} holdings loaded: {len(df_curr)} records.")
+            else:
+                 st.write(f"-> Q{quarter} {year} holdings: Failed to load or parse.")
 
-        st.write(f"--- Loading data for Manager CIK: {cik} ---")
 
-        # Fetch current quarter data using the cached function
-        df_curr = get_holdings_data(cik, year, quarter)
-        st.write(f"Q{quarter} {year} holdings loaded: {len(df_curr)} records found.")
+            # Fetch previous quarter data using the cached function
+            df_prev = get_holdings_data(cik, prev_year, prev_quarter)
+            if df_prev is not None:
+                 st.write(f"-> Q{prev_quarter} {prev_year} holdings loaded: {len(df_prev)} records.")
+            else:
+                 st.write(f"-> Q{prev_quarter} {prev_year} holdings: Failed to load or parse.")
 
-        # Fetch previous quarter data using the cached function
-        df_prev = get_holdings_data(cik, prev_year, prev_quarter)
-        st.write(f"Q{prev_quarter} {prev_year} holdings loaded: {len(df_prev)} records found.")
+            loaded_data[cik] = {'current': df_curr, 'previous': df_prev}
+        status.update(label="Data loading complete!", state="complete", expanded=False)
 
-        loaded_data[cik] = {'current': df_curr, 'previous': df_prev}
-
-    progress_bar.empty() # Remove progress bar when done
     return loaded_data
 
 # --- Display Logic ---
@@ -801,14 +923,10 @@ if not ciks:
     st.warning("Please enter at least one valid CIK in the sidebar.")
 else:
     # Load data for all selected CIKs first
-    # Use a spinner while loading all data
-    with st.spinner(f"Loading data for CIKs: {', '.join(ciks)}... Please wait."):
-         all_manager_data = load_manager_data(ciks, selected_year, selected_quarter)
+    all_manager_data = load_manager_data(ciks, selected_year, selected_quarter)
 
     if selected_view == "Manager View":
-        # FIX: Use selected_quarter
         st.header(f"Manager View - {selected_year} Q{selected_quarter}")
-        # Allow selecting which loaded CIK to view
         if ciks:
             selected_cik = st.selectbox("Select Manager CIK to Display", ciks)
         else:
@@ -820,21 +938,23 @@ else:
             df_prev = data['previous']
 
             if df_curr is None: # Check if loading failed for current
-                st.error(f"Could not load current quarter data for CIK {selected_cik}. See warnings above.")
-            elif not df_curr.empty:
-                st.subheader(f"Holdings Changes for CIK: {selected_cik} (Q{selected_quarter} {selected_year} vs Previous Q{get_previous_quarter(selected_year, selected_quarter)[1]} {get_previous_quarter(selected_year, selected_quarter)[0]})")
+                st.error(f"Could not load or parse current quarter ({selected_year} Q{selected_quarter}) data for CIK {selected_cik}. See warnings/errors during loading.")
+            elif df_curr.empty:
+                 # Current data loaded successfully but was empty
+                 st.info(f"No holdings data was found in the filing for CIK {selected_cik} for the selected quarter ({selected_year} Q{selected_quarter}). The manager might have held no reportable assets or filed an NT (Notice) report.")
+            else:
+                 # Current data exists
+                 prev_yr, prev_q = get_previous_quarter(selected_year, selected_quarter)
+                 st.subheader(f"Holdings Changes for CIK: {selected_cik} (Q{selected_quarter} {selected_year} vs Q{prev_q} {prev_yr})")
 
-                # Check if previous data is available
-                if df_prev is None:
-                    st.warning(f"Could not load previous quarter data for CIK {selected_cik}. Changes cannot be calculated.")
-                    df_changes = pd.DataFrame() # Or display current holdings only
-                else:
-                     df_changes = calculate_holding_changes(df_curr, df_prev)
+                 if df_prev is None:
+                      st.warning(f"Could not load previous quarter data for CIK {selected_cik}. Changes cannot be fully calculated. Displaying current holdings as 'New (Prev data N/A)'.")
+                      df_changes = calculate_holding_changes(df_curr, None) # Pass None explicitly
+                 else:
+                      df_changes = calculate_holding_changes(df_curr, df_prev)
 
-                if not df_changes.empty:
-                     # Display summary of changes
-                     st.metric("Total Holdings Reported (Current)", len(df_curr) if df_curr is not None else 0) # Use df_curr length
-                     # Handle case where df_changes might be empty even if df_curr is not
+                 if not df_changes.empty:
+                     st.metric("Total Holdings Reported (Current)", len(df_curr))
                      if 'change_type' in df_changes.columns:
                           change_counts = df_changes['change_type'].value_counts()
                      else:
@@ -848,45 +968,31 @@ else:
                      col5.metric("Unchanged/Value", change_counts.get('Unchanged', 0) + change_counts.get('Value Change Only', 0))
 
 
-                     # Format columns for display
                      df_display = df_changes[[
                          'cusip', 'nameOfIssuer', 'change_type',
                          'sshPrnamt', 'value',
                          'change_shares', 'change_value', 'change_pct'
-                     ]].sort_values(by=['change_type', 'value'], ascending=[True, False])
+                     ]].sort_values(by=['change_type', 'value'], ascending=[True, False]).reset_index(drop=True)
 
-                     # Improve formatting for display
                      st.dataframe(df_display.style.format({
                          'value': "${:,.0f}",
-                         'change_shares': "{:,.0f}",
-                         'change_value': "${:,.0f}",
+                         'change_shares': "{:+,}", # Add sign for changes
+                         'change_value': "${:+,}", # Add sign for changes
                          'change_pct': "{:.1f}%"
-                     }).format(precision=1, na_rep='N/A', subset=['change_pct']), # Handle potential NAs in percentage
+                     }).format(precision=1, na_rep='N/A', subset=['change_pct']),
                      use_container_width=True)
 
-                elif df_curr is not None and not df_curr.empty and df_prev is not None and df_prev.empty:
-                      # Only current data available, previous was empty (or first filing)
-                      st.info(f"Previous quarter data not found or empty for CIK {selected_cik}. Displaying current holdings as 'New'.")
-                      df_curr['change_type'] = 'New' # Mark all as new
-                      st.dataframe(df_curr[['cusip', 'nameOfIssuer', 'change_type', 'sshPrnamt', 'value']].style.format({'value': "${:,.0f}"}), use_container_width=True)
-
-                elif df_curr is not None and not df_curr.empty:
-                     # No changes calculated, but current data exists (and previous exists but maybe identical)
-                     st.info(f"No significant changes detected or previous data unavailable/identical for CIK {selected_cik}. Displaying current holdings.")
-                     st.dataframe(df_curr[['cusip', 'nameOfIssuer', 'sshPrnamt', 'value']].style.format({'value': "${:,.0f}"}), use_container_width=True)
-
-            # Handle case where current data is explicitly empty after successful fetch/parse
-            elif df_curr is not None and df_curr.empty:
-                 st.info(f"No holdings data was found in the filing for CIK {selected_cik} for the selected quarter ({selected_year} Q{selected_quarter}). The manager might have held no reportable assets or filed an NT (Notice) report.")
-            # else: handled by df_curr is None check above
+                 else:
+                      # Changes df is empty, but df_curr is not. Means prev data was identical or failed partially.
+                      st.info(f"No changes detected or previous data unavailable/identical for CIK {selected_cik}. Displaying current holdings.")
+                      st.dataframe(df_curr[['cusip', 'nameOfIssuer', 'sshPrnamt', 'value']].style.format({'value': "${:,.0f}"}), use_container_width=True)
 
 
     elif selected_view == "Stock View":
-        # FIX: Use selected_quarter
         st.header(f"Stock View - {selected_year} Q{selected_quarter}")
 
-        if not stock_cusip_input or len(stock_cusip_input) != 9:
-            st.warning("Please enter a valid 9-character CUSIP in the sidebar for the Stock View.")
+        if not stock_cusip_input or len(stock_cusip_input) < 8: # Allow 8 or 9
+            st.warning("Please enter a valid 8 or 9-character CUSIP in the sidebar for the Stock View.")
         elif not all_manager_data:
              st.warning("No manager data loaded. Please check CIKs and selected quarter.")
         else:
@@ -903,26 +1009,8 @@ else:
                       logging.warning(f"Skipping CIK {cik} for stock view due to missing current data.")
                       continue
 
-                 # Calculate changes specific to this manager for context
-                 # Need previous data to calculate changes
-                 if df_prev is None:
-                     logging.warning(f"Skipping change calculation for CIK {cik} in stock view due to missing previous data.")
-                     # Check if stock exists only in current data (New position)
-                     current_stock_row = df_curr[df_curr['cusip'] == stock_cusip_input]
-                     if not current_stock_row.empty:
-                          activity = current_stock_row.iloc[0].to_dict()
-                          activity['cik'] = cik
-                          activity['change_type'] = 'New (Prev data N/A)'
-                          activity['change_shares'] = activity['sshPrnamt']
-                          activity['change_value'] = activity['value']
-                          activity['change_pct'] = 100.0
-                          stock_activity.append(activity)
-                          if stock_name == "Unknown Stock" and pd.notna(activity['nameOfIssuer']):
-                              stock_name = activity['nameOfIssuer']
-                     continue # Move to next CIK
-
-
-                 df_changes = calculate_holding_changes(df_curr, df_prev)
+                 # Calculate changes specific to this manager
+                 df_changes = calculate_holding_changes(df_curr, df_prev) # Handles df_prev being None
 
                  # Find the specific stock in the changes df
                  stock_row = df_changes[df_changes['cusip'] == stock_cusip_input]
@@ -934,7 +1022,8 @@ else:
                      # Try to get a consistent stock name
                      if stock_name == "Unknown Stock" and pd.notna(activity['nameOfIssuer']):
                          stock_name = activity['nameOfIssuer']
-                 # Note: calculate_holding_changes should handle exited positions already
+                 # calculate_holding_changes handles exited positions if df_prev was available
+
 
             if stock_activity:
                 st.subheader(f"Activity for {stock_name} (CUSIP: {stock_cusip_input})")
@@ -944,14 +1033,14 @@ else:
                      'cik', 'cusip', 'nameOfIssuer', 'change_type',
                      'sshPrnamt', 'value',
                      'change_shares', 'change_value', 'change_pct'
-                ]].sort_values(by=['change_type', 'value'], ascending=[True, False])
+                ]].sort_values(by=['change_type', 'value'], ascending=[True, False]).reset_index(drop=True)
 
                 st.dataframe(df_stock_display.style.format({
                      'value': "${:,.0f}",
-                     'change_shares': "{:,.0f}",
-                     'change_value': "${:,.0f}",
+                     'change_shares': "{:+,}", # Add sign
+                     'change_value': "${:+,}", # Add sign
                      'change_pct': "{:.1f}%"
-                }).format(precision=1, na_rep='N/A', subset=['change_pct']), # Handle potential NAs in percentage
+                }).format(precision=1, na_rep='N/A', subset=['change_pct']), # Handle NAs
                 use_container_width=True)
             else:
                 st.info(f"No activity found for CUSIP {stock_cusip_input} among the selected managers ({', '.join(ciks)}) for the period {selected_year} Q{selected_quarter} vs Previous.")
