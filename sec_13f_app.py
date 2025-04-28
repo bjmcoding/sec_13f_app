@@ -42,7 +42,7 @@ class SECEdgarHandler:
     """
     BASE_URL = "https://www.sec.gov"
     ARCHIVES_URL = f"{BASE_URL}/Archives/edgar/data"
-    SUBMISSIONS_API_URL = f"{BASE_URL}/submissions/CIK{{cik}}.json"
+SUBMISSIONS_API_URL = f"https://data.sec.gov/submissions/CIK{{cik}}.json"
 
     def __init__(self, user_agent):
         self.user_agent = user_agent
@@ -606,7 +606,7 @@ else:
     all_manager_data = load_manager_data(ciks, selected_year, selected_quarter)
 
     if selected_view == "Manager View":
-        st.header(f"Manager View - {selected_year} Q{quarter}")
+st.header(f"Manager View - {selected_year} Q{selected_quarter}")
         selected_cik = st.selectbox("Select Manager CIK to Display", ciks)
 
         if selected_cik in all_manager_data:
@@ -653,8 +653,7 @@ else:
                 st.warning(f"No holdings data found or parsed for CIK {selected_cik} for the selected quarter ({selected_year} Q{selected_quarter}).")
 
     elif selected_view == "Stock View":
-        st.header(f"Stock View - {selected_year} Q{quarter}")
-
+       st.header(f"Stock View - {selected_year} Q{selected_quarter}")
         if not stock_cusip_input or len(stock_cusip_input) != 9:
             st.warning("Please enter a valid 9-character CUSIP in the sidebar for the Stock View.")
         elif not all_manager_data:
